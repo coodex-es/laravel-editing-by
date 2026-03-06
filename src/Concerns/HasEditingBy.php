@@ -217,7 +217,7 @@ trait HasEditingBy
             DB::raw("{$usersAlias}.name as editing_by_name"),
             DB::raw("{$usersAlias}.surname as editing_by_surname"),
             DB::raw("{$usersAlias}.email as editing_by_email"),
-            DB::raw("{$fullNameExpression} as locked_by"),
+            DB::raw("{$fullNameExpression} as editing_by_fullname"),
         ]);
     }
 

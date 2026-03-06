@@ -130,6 +130,6 @@ class HasEditingByTest extends TestCase
         $this->assertSame('Alice', $loadedItem->editing_by_name);
         $this->assertSame('Johnson', $loadedItem->editing_by_surname);
         $this->assertSame('alice@example.com', $loadedItem->editing_by_email);
-        $this->assertSame('Alice Johnson', $loadedItem->locked_by);
+        $this->assertSame('Alice Johnson', $loadedItem->editing_by_fullname);
     }
 }

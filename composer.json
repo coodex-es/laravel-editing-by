@@ -1,7 +1,7 @@
 {
     "name": "coodex-es/laravel-editing-by",
     "description": "Track active editing ownership for Eloquent models.",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "type": "library",
     "license": "GPL-3.0-or-later",
     "require": {
