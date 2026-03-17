@@ -66,6 +66,34 @@ class HasEditingByTest extends TestCase
         $this->assertTrue($secondExpiration->gt($firstExpiration));
     }
 
+    public function test_mark_editing_recovers_when_a_concurrent_insert_creates_the_same_users_lock(): void
+    {
+        $user = TestUser::query()->create(['name' => 'Alice']);
+        $persistedItem = TestItem::query()->create(['name' => 'Draft']);
+        $item = $this->makeRaceConditionItem($persistedItem, $user);
+
+        Auth::login($user);
+
+        $item->markEditing();
+
+        $this->assertDatabaseCount('model_editings', 1);
+        $this->assertSame((string) $user->id, (string) Editing::query()->firstOrFail()->user_id);
+    }
+
+    public function test_mark_editing_throws_the_expected_exception_when_a_concurrent_insert_wins_for_another_user(): void
+    {
+        $alice = TestUser::query()->create(['name' => 'Alice']);
+        $bob = TestUser::query()->create(['name' => 'Bob']);
+        $persistedItem = TestItem::query()->create(['name' => 'Draft']);
+        $item = $this->makeRaceConditionItem($persistedItem, $alice);
+
+        Auth::login($bob);
+
+        $this->expectException(ModelIsBeingEditedException::class);
+
+        $item->markEditing();
+    }
+
     public function test_is_being_edited_ignores_the_current_user(): void
     {
         $user = TestUser::query()->create(['name' => 'Alice']);
@@ -131,5 +159,47 @@ class HasEditingByTest extends TestCase
         $this->assertSame('Johnson', $loadedItem->editing_by_surname);
         $this->assertSame('alice@example.com', $loadedItem->editing_by_email);
         $this->assertSame('Alice Johnson', $loadedItem->editing_by_fullname);
+    }
+
+    protected function makeRaceConditionItem(TestItem $item, TestUser $competingUser): TestItem
+    {
+        $raceConditionItem = new class extends TestItem
+        {
+            protected bool $shouldSimulateConflictingInsert = true;
+
+            protected ?TestUser $competingUser = null;
+
+            public function simulateConflictingInsertWith(TestUser $competingUser): static
+            {
+                $this->competingUser = $competingUser;
+
+                return $this;
+            }
+
+            protected function createEditingRecord(int|string $userId): ?Editing
+            {
+                if ($this->shouldSimulateConflictingInsert) {
+                    $this->shouldSimulateConflictingInsert = false;
+
+                    Editing::query()->create([
+                        'item_type' => $this->getMorphClass(),
+                        'item_id' => (string) $this->getKey(),
+                        'user_id' => $this->competingUser?->getKey(),
+                        'expiration' => $this->freshEditingExpiration(),
+                    ]);
+
+                    return null;
+                }
+
+                return parent::createEditingRecord($userId);
+            }
+        };
+
+        $raceConditionItem->forceFill($item->getAttributes());
+        $raceConditionItem->exists = true;
+        $raceConditionItem->setConnection($item->getConnectionName());
+        $raceConditionItem->simulateConflictingInsertWith($competingUser);
+
+        return $raceConditionItem;
     }
 }

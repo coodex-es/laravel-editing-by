@@ -1,6 +1,6 @@
 # Laravel Editing By
 
-Version: `1.1.0`
+Version: `1.2.0`
 
 `coodex-es/laravel-editing-by` permite reservar temporalmente la edición de cualquier modelo Eloquent para evitar conflictos entre usuarios mientras trabajan sobre la misma ficha.
 

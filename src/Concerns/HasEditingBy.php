@@ -6,7 +6,9 @@ use CoodexEs\LaravelEditingBy\Events\EditingTakenOver;
 use CoodexEs\LaravelEditingBy\Exceptions\ModelIsBeingEditedException;
 use CoodexEs\LaravelEditingBy\Models\Editing;
 use CoodexEs\LaravelEditingBy\Support\EditingByConfig;
-use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Database\Eloquent\Relations\MorphOne;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
@@ -26,6 +28,7 @@ trait HasEditingBy
 
     public function editingRecord(): ?Editing
     {
+        /** @var Editing|null $editing */
         $editing = $this->relationLoaded('editing')
             ? $this->getRelation('editing')
             : $this->editing()->with('user')->first();
@@ -56,39 +59,35 @@ trait HasEditingBy
             throw new \RuntimeException('markEditing requires an authenticated user.');
         }
 
-        DB::transaction(function () use ($userId): void {
-            $editing = Editing::query()
-                ->where('item_type', $this->getMorphClass())
-                ->where('item_id', (string) $this->getKey())
-                ->lockForUpdate()
-                ->with('user')
-                ->first();
+        $editing = $this->createEditingRecord($userId);
 
-            if ($editing && $editing->expiration->isPast()) {
-                $editing->delete();
-                $editing = null;
+        if ($editing) {
+            $this->setRelation('editing', $editing->load('user'));
+
+            return;
+        }
+
+        DB::transaction(function () use ($userId): void {
+            $editing = $this->lockEditingRecord();
+
+            if (! $editing) {
+                $editing = $this->createEditingRecord($userId) ?? $this->lockEditingRecord();
             }
 
-            if ($editing && (string) $editing->user_id !== (string) $userId) {
+            if (! $editing) {
+                throw new \RuntimeException('Unable to create or load the editing record.');
+            }
+
+            if (! $editing->expiration->isPast() && (string) $editing->user_id !== (string) $userId) {
                 throw new ModelIsBeingEditedException($editing);
             }
 
-            if ($editing) {
-                $editing->forceFill([
-                    'expiration' => $this->freshEditingExpiration(),
-                ])->save();
-
-                $this->setRelation('editing', $editing->fresh('user'));
-
-                return;
-            }
-
-            $editing = $this->editing()->create([
+            $editing->forceFill([
                 'user_id' => $userId,
                 'expiration' => $this->freshEditingExpiration(),
-            ]);
+            ])->save();
 
-            $this->setRelation('editing', $editing->load('user'));
+            $this->setRelation('editing', $editing->fresh('user'));
         });
     }
 
@@ -100,6 +99,7 @@ trait HasEditingBy
             throw new \RuntimeException('addEditingTime requires an authenticated user.');
         }
 
+        /** @var Editing|null $editing */
         $editing = $this->editing()->where('user_id', $userId)->first();
 
         if (! $editing) {
@@ -121,6 +121,7 @@ trait HasEditingBy
             throw new \RuntimeException('releaseEditing requires an authenticated user.');
         }
 
+        /** @var Editing|null $editing */
         $editing = $this->editing()->where('user_id', $userId)->first();
 
         if (! $editing) {
@@ -141,34 +142,28 @@ trait HasEditingBy
             throw new \RuntimeException('takeOverEditing requires an authenticated user.');
         }
 
+        $editing = $this->createEditingRecord($userId);
+
+        if ($editing) {
+            $this->setRelation('editing', $editing->load('user'));
+
+            return;
+        }
+
         DB::transaction(function () use ($userId, $user): void {
-            $editing = Editing::query()
-                ->where('item_type', $this->getMorphClass())
-                ->where('item_id', (string) $this->getKey())
-                ->lockForUpdate()
-                ->with('user')
-                ->first();
-
-            if ($editing && $editing->expiration->isPast()) {
-                $editing->delete();
-                $editing = null;
-            }
-
-            $previousUser = $editing?->user;
+            $editing = $this->lockEditingRecord();
 
             if (! $editing) {
-                $created = $this->editing()->create([
-                    'user_id' => $userId,
-                    'expiration' => $this->freshEditingExpiration(),
-                ])->load('user');
-
-                $this->setRelation('editing', $created);
-
-                return;
+                $editing = $this->createEditingRecord($userId) ?? $this->lockEditingRecord();
             }
 
-            if ((string) $editing->user_id === (string) $userId) {
+            if (! $editing) {
+                throw new \RuntimeException('Unable to create or load the editing record.');
+            }
+
+            if ($editing->expiration->isPast() || (string) $editing->user_id === (string) $userId) {
                 $editing->forceFill([
+                    'user_id' => $userId,
                     'expiration' => $this->freshEditingExpiration(),
                 ])->save();
 
@@ -176,6 +171,8 @@ trait HasEditingBy
 
                 return;
             }
+
+            $previousUser = $editing->user;
 
             $editing->forceFill([
                 'user_id' => $userId,
@@ -189,7 +186,7 @@ trait HasEditingBy
         });
     }
 
-    public function scopeWithActiveEditor(Builder $query, bool $excludeCurrentUser = true): Builder
+    public function scopeWithActiveEditor(EloquentBuilder $query, bool $excludeCurrentUser = true): EloquentBuilder
     {
         $editingTable = EditingByConfig::editingTable();
         $userTable = EditingByConfig::userTable();
@@ -231,5 +228,59 @@ trait HasEditingBy
         return property_exists($this, 'editingTtlSeconds')
             ? (int) $this->editingTtlSeconds
             : (int) config('editing-by.default_ttl_seconds', 20);
+    }
+
+    protected function editingRecordQuery(): EloquentBuilder
+    {
+        return Editing::query()
+            ->where('item_type', $this->getMorphClass())
+            ->where('item_id', (string) $this->getKey());
+    }
+
+    protected function lockEditingRecord(): ?Editing
+    {
+        /** @var Editing|null $editing */
+        $editing = $this->editingRecordQuery()
+            ->lockForUpdate()
+            ->with('user')
+            ->first();
+
+        return $editing;
+    }
+
+    protected function createEditingRecord(int|string $userId): ?Editing
+    {
+        for ($attempt = 1; $attempt <= $this->editingWriteAttempts(); $attempt++) {
+            try {
+                return $this->editing()->create([
+                    'user_id' => $userId,
+                    'expiration' => $this->freshEditingExpiration(),
+                ]);
+            } catch (UniqueConstraintViolationException) {
+                return null;
+            } catch (QueryException $exception) {
+                if (! $this->isRetryableEditingWriteException($exception) || $attempt === $this->editingWriteAttempts()) {
+                    throw $exception;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    protected function editingWriteAttempts(): int
+    {
+        return 3;
+    }
+
+    protected function isRetryableEditingWriteException(QueryException $exception): bool
+    {
+        $code = (string) $exception->getCode();
+        $message = strtolower($exception->getMessage());
+
+        return in_array($code, ['1205', '1213', '40001'], true)
+            || str_contains($message, 'deadlock found')
+            || str_contains($message, 'lock wait timeout exceeded')
+            || str_contains($message, 'database is locked');
     }
 }
